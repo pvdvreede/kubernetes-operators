@@ -1,11 +1,21 @@
 package president
 
 import (
+	"context"
 	"log"
 	"math/rand"
 	"sync"
 	"time"
 
+	"crypto/x509"
+	"encoding/pem"
+
+	"crypto/rsa"
+	"crypto/tls"
+
+	"errors"
+
+	"github.com/sapcc/go-vice"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -20,6 +30,7 @@ import (
 )
 
 const CERTIFICATE_RECHECK_INTERVAL = 5 * time.Second
+const CERTIFICATE_VALIDITY_MONTH = 1
 
 var (
 	VERSION      = "0.0.0.dev"
@@ -37,6 +48,7 @@ type Operator struct {
 	Options
 
 	clientset       *kubernetes.Clientset
+	viceClient      *vice.Client
 	ingressInformer cache.SharedIndexInformer
 	secretInformer  cache.SharedIndexInformer
 
@@ -51,19 +63,29 @@ func New(options Options) *Operator {
 		log.Fatalf("Couldn't create Kubernetes client: %s", err)
 	}
 
+	cert, err := tls.LoadX509KeyPair(options.ViceCrtFile, options.ViceKeyFile)
+	if err != nil {
+		log.Fatalf("Couldn't not load certificate and/or key for vice client: %s", err)
+	}
+	viceClient := vice.New(cert)
+	if viceClient == nil {
+		log.Fatalf("Couldn't create vice client: %s", err)
+	}
+
 	operator := &Operator{
-		Options:   options,
-		clientset: clientset,
-		queue:     workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		Options:    options,
+		clientset:  clientset,
+		viceClient: viceClient,
+		queue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
 	}
 
 	ingressInformer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options meta_v1.ListOptions) (runtime.Object, error) {
-				return clientset.Extensions().Ingresses(v1.NamespaceAll).List(meta_v1.ListOptions{})
+				return clientset.Ingresses(v1.NamespaceAll).List(meta_v1.ListOptions{})
 			},
 			WatchFunc: func(options meta_v1.ListOptions) (watch.Interface, error) {
-				return clientset.Extensions().Ingresses(v1.NamespaceAll).Watch(meta_v1.ListOptions{})
+				return clientset.Ingresses(v1.NamespaceAll).Watch(meta_v1.ListOptions{})
 			},
 		},
 		&v1beta1.Ingress{},
@@ -74,10 +96,10 @@ func New(options Options) *Operator {
 	secretInformer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options meta_v1.ListOptions) (runtime.Object, error) {
-				return clientset.Core().Secrets(v1.NamespaceAll).List(meta_v1.ListOptions{})
+				return clientset.Secrets(v1.NamespaceAll).List(meta_v1.ListOptions{})
 			},
 			WatchFunc: func(options meta_v1.ListOptions) (watch.Interface, error) {
-				return clientset.Core().Secrets(v1.NamespaceAll).Watch(meta_v1.ListOptions{})
+				return clientset.Secrets(v1.NamespaceAll).Watch(meta_v1.ListOptions{})
 			},
 		},
 		&v1.Secret{},
@@ -184,29 +206,236 @@ func (vp *Operator) syncHandler(key interface{}) error {
 
 	ingress := o.(*v1beta1.Ingress)
 	for _, tls := range ingress.Spec.TLS {
+
 		log.Printf("Checking Ingress %v/%v: Hosts: %v, Secret: %v/%v", ingress.Namespace, ingress.Name, tls.Hosts, ingress.Namespace, tls.SecretName)
+
+		random := rand.Intn(640) + 1
+		time.Sleep(time.Duration(random) * time.Millisecond)
+
+		for _,host := range tls.Hosts {
+
+			var err error
+
+			// does the secret exist?
+			secret, err := vp.getSecret(ingress.Namespace, tls.SecretName)
+			if err != nil {
+				log.Printf("Couldn't get secret for ingress %s/%s and host %s. Enrolling new one.",ingress.Namespace,ingress.Name,host)
+				cert, err := vp.enrollCertificate()
+				log.Printf(string(cert.Raw)) //TODO: update secret and ingress
+				if err != nil {
+					log.Printf("Couldn't enroll new certificate for ingress %s/%s and host %s.",ingress.Namespace,ingress.Name,host)
+					return err
+				}
+				return nil
+			}
+
+			// does the certificate exists? can it be decoded and parsed?
+			cert, key, err := vp.getCertificateFromSecret(secret)
+			if err != nil {
+				log.Printf("Couldn't get certificate from secret %s for ingress %s/%s ,host %s. Enrolling new one.",secret.Name,ingress.Namespace,ingress.Name,host)
+				cert, err := vp.enrollCertificate()
+				log.Printf(string(cert.Raw)) //TODO: update secret and ingress
+				if err != nil {
+					log.Printf("Couldn't enroll new certificate for ingress %s/%s and host %s.",ingress.Namespace,ingress.Name,host)
+					return err
+				}
+				return nil
+			}
+
+			// does the secret contain the correct key for the certificate?
+			if !vp.doesKeyAndCertificateTally(cert, key) {
+				log.Printf("Certificate and Key don't match secret %s of ingress %s/%s and host %s .",secret.Name,ingress.Namespace,ingress.Name,host)
+				cert, err := vp.enrollCertificate()
+				log.Printf(string(cert.Raw)) //TODO: update secret and ingress
+				if err != nil {
+					log.Printf("Couldn't enroll new certificate for ingress %s/%s and host %s.",ingress.Namespace,ingress.Name,host)
+					return err
+				}
+				return errors.New("Certificate and Key don't match.")
+			}
+
+			//  is the certificate for the correct host?
+			if !vp.doesCertificateAndHostMatch(cert,host) {
+				log.Printf("Certificate reports wrong host. Enrolling new certificate for %s.",host)
+				cert, err := vp.enrollCertificate()
+				log.Printf(string(cert.Raw)) //TODO: update secret and ingress
+				if err != nil {
+					log.Printf("Couldn't enroll new certificate for ingress %s/%s and host %s.",ingress.Namespace,ingress.Name,host)
+					return err
+				}
+				return nil
+			}
+
+			// is the certificate valid for time t ?
+			if vp.doesCertificateExpireSoon(cert) {
+				log.Printf("Certificate for host %s will expire in %s month. Renewing",host,CERTIFICATE_VALIDITY_MONTH)
+				cert, err := vp.renewCertificate(cert)
+				log.Printf(string(cert.Raw)) //TODO: update secret and ingress
+				if err != nil {
+					log.Printf("Couldn't renew certificate for ingress %s/%s and host %s.",ingress.Namespace,ingress.Name,host)
+					return err
+				}
+			}
+
+			return nil
+		}
 	}
-
-	random := rand.Intn(640) + 1
-	time.Sleep(time.Duration(random) * time.Millisecond)
-
-	// Does Secret Exist?
-	// Does the secret contain the correct keys?
-	// Can the certifiate be parse?
-	// Is the certificate for the correct host(s)?
-	// Is the certificate still valid for time X?
-	// If any error then recreate certificate
-
-	_, err = vp.getIngressSecret(ingress)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
-func (vp *Operator) getIngressSecret(ingress *v1beta1.Ingress) (*v1.Secret, error) {
-	return nil, nil
+func (vp *Operator) enrollCertificate() (newCert *x509.Certificate, err error) {
+	enrollment, err := vp.viceClient.Certificates.Enroll(
+		context.TODO(),
+		&vice.EnrollRequest{
+			FirstName:           "Michael",
+			LastName:            "Schmidt",
+			Email:               "michael.schmidt@email.com",
+			CSR:                 string("CSR"),
+			SubjectAltNames:     []string{},
+			Challenge:           "Passwort1!",
+			CertProductType:     vice.CertProductType.Server,
+			ServerType:          vice.ServerType.OpenSSL,
+			ValidityPeriod:      vice.ValidityPeriod.OneYear,
+			SignatureAlgorithm:  vice.SignatureAlgorithm.SHA256WithRSAEncryption,
+		},
+	)
+
+	if err != nil {
+		log.Printf("Couldn't enroll new certificate %s",err.Error())
+		return nil, err
+	}
+
+	newCert,err = x509.ParseCertificate([]byte( enrollment.Certificate))
+	if err != nil {
+		log.Printf("Couldn't parse certificate: %s",err)
+		return nil,err
+	}
+	return newCert,nil
+}
+
+
+func (vp *Operator) renewCertificate(oldCert *x509.Certificate) (newCert *x509.Certificate, err error) {
+	renewal, err := vp.viceClient.Certificates.Renew(
+		context.TODO(),
+		&vice.RenewRequest{
+			FirstName:           oldCert.Issuer.CommonName,
+			LastName:            "Schmidt",
+			Email:               "michael.schmidt@email.com",
+			CSR:                 "CSR",
+			SubjectAltNames:     oldCert.DNSNames,  //TODO: oldCert.Extensions
+			OriginalCertificate: string(oldCert.Raw),
+			OriginalChallenge:   "Passwort1!",
+			Challenge:           "Passwort2!",
+			CertProductType:     vice.CertProductType.Server,
+			ServerType:          vice.ServerType.OpenSSL,
+			ValidityPeriod:      vice.ValidityPeriod.OneYear,
+			SignatureAlgorithm:  vice.SignatureAlgorithm.SHA256WithRSAEncryption,
+		},
+	)
+	if err != nil {
+		log.Printf("Couldn't renew certificate: %s.",err)
+		return nil,err
+	}
+	newCert,err = x509.ParseCertificate([]byte(renewal.Certificate))
+	if err != nil {
+		log.Printf("Couldn't parse certificate: %s",err)
+		return nil,err
+	}
+	return newCert,nil
+}
+
+func (vp *Operator) doesCertificateAndHostMatch(cert *x509.Certificate, host string) bool {
+
+	//TODO: verify cert
+	/*opts := x509.VerifyOptions{
+		DNSName: "mail.google.com",
+		Roots:   roots,
+	}
+
+	if _, err := cert.Verify(opts); err != nil {
+		panic("failed to verify certificate: " + err.Error())
+	}*/
+
+	return true
+}
+
+// already expired or will the certificate expire within the next n month
+func (vp *Operator) doesCertificateExpireSoon(cert *x509.Certificate) bool {
+	return cert.NotAfter.UTC().After(time.Now().UTC().AddDate(0, CERTIFICATE_VALIDITY_MONTH, 0))
+}
+
+func (vp *Operator) doesKeyAndCertificateTally(cert *x509.Certificate, key *rsa.PrivateKey) bool {
+
+	certBlock := pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: []byte(cert),
+	}
+
+	keyBlock := pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: []byte(key),
+	}
+
+	if _, err := tls.X509KeyPair(pem.EncodeToMemory(&certBlock), pem.EncodeToMemory(&keyBlock)); err != nil {
+		log.Printf("Certificate and Key don't match: %s", err)
+		return false
+	}
+	return true
+}
+
+// get secret by namespace and name
+func (vp *Operator) getSecret(namespace string, secretName string) (*v1.Secret, error) {
+	return vp.clientset.Secrets(namespace).Get(secretName, meta_v1.GetOptions{})
+}
+
+func (vp *Operator) getCertificateFromSecret(secret *v1.Secret) (cert *x509.Certificate, key *rsa.PrivateKey, err error) {
+
+	for k, v := range secret.StringData {
+		switch k {
+		case "tls.cert":
+			cert, err = vp.getCertificateFromPEM(v)
+		case "tls.key":
+			key, err = vp.getPrivateKeyFromPEM(v)
+		}
+	}
+	if err != nil {
+		log.Printf(err.Error())
+		return nil, nil, err
+	}
+	if cert == nil && key == nil {
+		log.Printf("Neither certificate nor private key found in secret: %s", secret.Name)
+		return nil, nil, err
+	}
+	return cert, key, nil
+}
+
+func (vp *Operator) getPrivateKeyFromPEM(keyPEM string) (key *rsa.PrivateKey, err error) {
+	block, _ := pem.Decode([]byte(keyPEM))
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block containing the public key")
+	}
+	key, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		log.Printf("Could not parse private key: %s", err.Error())
+		return nil, err
+	}
+	return key, nil
+}
+
+func (vp *Operator) getCertificateFromPEM(certPEM string) (cert *x509.Certificate, err error) {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block containing certificate.")
+	}
+	if block.Type != "CERTIFICATE" {
+		return nil, errors.New("certificate contains invalid data")
+	}
+	cert, err = x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		log.Printf("failed to parse certificate: %s", err.Error())
+		return nil, err
+	}
+	return cert, nil
 }
 
 func (vp *Operator) ingressAdd(obj interface{}) {
@@ -215,9 +444,22 @@ func (vp *Operator) ingressAdd(obj interface{}) {
 }
 
 func (vp *Operator) ingressDelete(obj interface{}) {
+	i := obj.(*v1beta1.Ingress)
+	//err := vp.clientset.Ingresses(i.Namespace).Delete(i.Name,&meta_v1.DeleteOptions{})
+	//if err != nil {
+	//	log.Printf("Could not delete ingress %s in namespace .",i.Name,i.Namespace)
+	//}
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(i)
+	if err == nil {
+		vp.queue.Add(key)
+	}
 }
 
 func (vp *Operator) ingressUpdate(cur, old interface{}) {
+	key, err := cache.MetaNamespaceKeyFunc(cur)
+	if err == nil {
+		vp.queue.Add(key)
+	}
 }
 
 func (vp *Operator) checkCertificates() {
