@@ -22,6 +22,9 @@ bin/%/$(BINARY): $(GOFILES) Makefile
 build: bin/linux/$(BINARY)
 	docker build -t $(IMAGE):$(VERSION) .
 
+tests: build
+	go test -v pkg/tests/*.go
+
 push:
 	docker push $(IMAGE):$(VERSION)
 
