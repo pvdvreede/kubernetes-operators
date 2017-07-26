@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
 	"reflect"
+	"fmt"
 )
 
 const CERTIFICATE_RECHECK_INTERVAL = 5 * time.Second
@@ -230,10 +231,11 @@ func (vp *Operator) processNextWorkItem() bool {
 func (vp *Operator) syncHandler(key interface{}) error {
 	o, exists, err := vp.ingressInformer.GetStore().Get(key)
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed to fetch key %s from cache: %s",key,err)
 	}
 
 	if !exists {
+		log.Printf("Deleting ingress %s (maybe in the future)", key)
 		return nil
 	}
 
@@ -629,46 +631,49 @@ func (vp *Operator) ingressAdd(obj interface{}) {
 
 func (vp *Operator) ingressDelete(obj interface{}) {
 	i := obj.(*v1beta1.Ingress)
-	err := vp.Clientset.Ingresses(i.Namespace).Delete(i.Name, &meta_v1.DeleteOptions{})
-	if err != nil {
-		log.Printf("Could not delete ingress %s/%s.", i.Namespace, i.Name)
-		return
-	}
-	//key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(i)
-	//if err == nil {
-	//	vp.queue.Add(key)
-	//}
+	log.Printf("Deleted ingress %s/%s.",i.GetNamespace(),i.GetName())
 	vp.queue.Add(i)
-	log.Printf("Deleted ingress %s/%s.", i.Namespace, i.Name)
-
 }
 
 func (vp *Operator) ingressUpdate(cur, old interface{}) {
 	iOld := old.(*v1beta1.Ingress)
 	iCur := cur.(*v1beta1.Ingress)
 
-	if !reflect.DeepEqual(iOld.Spec,iCur.Spec) {
-		return
-	}
-
-	key, err := cache.MetaNamespaceKeyFunc(iCur)
-	if err != nil {
-		return
-	}
-	vp.queue.Add(key)
-	log.Printf("Updated ingress %s/%s",iCur.Namespace,iCur.Name)
-}
-
-func (vp *Operator) checkCertificates() {
-	for _, o := range vp.ingressInformer.GetStore().List() {
-		ingress := o.(*v1beta1.Ingress)
-		vp.queue.Add(ingress)
+	if reflect.DeepEqual(iOld.Spec,iCur.Spec) {
+		log.Printf("Updated ingress %s/%s",iOld.GetNamespace(),iOld.GetName())
+		vp.queue.Add(iCur)
 	}
 }
 
 func (vp *Operator) secretAdd(obj interface{}) {
 	s := obj.(*v1.Secret)
+	log.Printf("Added secret %s/%s",s.GetNamespace(),s.GetName())
 	vp.queue.Add(s)
+}
+
+func (vp *Operator) secretDelete(obj interface{}) {
+	s := obj.(*v1.Secret)
+	log.Printf("Deleted secret %s/%s",s.GetNamespace(),s.GetName())
+	vp.queue.Add(s)
+
+}
+
+func (vp *Operator) secretUpdate(cur, old interface{}) {
+	sOld := old.(*v1.Secret)
+	sCur := cur.(*v1.Secret)
+
+	if reflect.DeepEqual(sOld.Data,sCur.Data) {
+		log.Printf("Updated secret %s/%s",sOld.GetNamespace(),sOld.GetName())
+		vp.queue.Add(sCur)
+	}
+}
+
+func (vp *Operator) checkCertificates() {
+	for _, o := range vp.ingressInformer.GetStore().List() {
+		i := o.(*v1beta1.Ingress)
+		log.Printf("Added ingress %s/%s",i.GetNamespace(),i.GetName())
+		vp.queue.Add(i)
+	}
 }
 
 func readCertFromFile(filePath string) (cert *x509.Certificate, err error) {
