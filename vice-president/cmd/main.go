@@ -16,6 +16,7 @@ var options president.Options
 
 func init() {
 	pflag.StringVar(&options.KubeConfig, "kubeconfig", "", "Path to kubeconfig file with authorization and master location information.")
+	pflag.StringVar(&options.ViceConfig, "vice-config", "", "Path to VICE config file with certificate parameters.")
 	pflag.StringVar(&options.ViceCrtFile, "vice-cert", "", "A PEM encoded certificate file.")
 	pflag.StringVar(&options.ViceKeyFile, "vice-key", "", "A PEM encoded private key file.")
 }

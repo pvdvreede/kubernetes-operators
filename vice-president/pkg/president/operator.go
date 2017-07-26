@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	yaml "gopkg.in/yaml.v1"
+
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -20,6 +22,9 @@ import (
 	"encoding/base64"
 	"io/ioutil"
 
+	"fmt"
+	"reflect"
+
 	"github.com/sapcc/go-vice"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,8 +37,6 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
-	"reflect"
-	"fmt"
 )
 
 const CERTIFICATE_RECHECK_INTERVAL = 5 * time.Second
@@ -50,6 +53,7 @@ var (
 
 type Options struct {
 	KubeConfig string
+	ViceConfig string
 
 	ViceKeyFile string
 	ViceCrtFile string
@@ -57,6 +61,8 @@ type Options struct {
 
 type Operator struct {
 	Options
+
+	ViceConfig ViceConfig
 
 	Clientset       *kubernetes.Clientset
 	ViceClient      *vice.Client
@@ -68,8 +74,36 @@ type Operator struct {
 	queue workqueue.RateLimitingInterface
 }
 
+type ViceConfig struct {
+	FirstName          string `yaml:"first_name"`
+	LastName           string `yaml:"last_name"`
+	EMail              string `yaml:"email"`
+	Country            string `yaml:"country"`
+	Province           string `yaml:"province"`
+	Locality           string `yaml:"locality"`
+	Organization       string `yaml:"organization"`
+	OrganizationalUnit string `yaml:"organizational_unit"`
+}
+
+func readViceConfig(filePath string) (cfg ViceConfig, err error) {
+	cfgBytes, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("read configuration file: %s", err.Error())
+	}
+	err = yaml.Unmarshal(cfgBytes, &cfg)
+	if err != nil {
+		return nil, fmt.Errorf("parse configuration: %s", err.Error())
+	}
+	return cfg, nil
+}
+
 func New(options Options) *Operator {
 	config := newClientConfig(options)
+
+	viceConfig, err := readViceConfig(options.ViceConfig)
+	if err != nil {
+		log.Fatalf("Could get vice configuration: %s", err)
+	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -108,6 +142,7 @@ func New(options Options) *Operator {
 	operator := &Operator{
 		Options:      options,
 		Clientset:    clientset,
+		ViceConfig:   viceConfig,
 		ViceClient:   viceClient,
 		rootCertPool: rootCertPool,
 		queue:        workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
@@ -231,7 +266,7 @@ func (vp *Operator) processNextWorkItem() bool {
 func (vp *Operator) syncHandler(key interface{}) error {
 	o, exists, err := vp.ingressInformer.GetStore().Get(key)
 	if err != nil {
-		return fmt.Errorf("Failed to fetch key %s from cache: %s",key,err)
+		return fmt.Errorf("Failed to fetch key %s from cache: %s", key, err)
 	}
 
 	if !exists {
@@ -328,9 +363,9 @@ func (vp *Operator) enrollCertificate(sans []string) (newCert *x509.Certificate,
 	enrollment, err := vp.ViceClient.Certificates.Enroll(
 		context.TODO(),
 		&vice.EnrollRequest{
-			FirstName:          "Michael",
-			LastName:           "Schmidt",
-			Email:              "michael.schmidt@email.com",
+			FirstName:          vp.ViceConfig.FirstName,
+			LastName:           vp.ViceConfig.LastName,
+			Email:              vp.ViceConfig.EMail,
 			CSR:                string(csr),
 			SubjectAltNames:    sans,
 			Challenge:          "Passwort1!",
@@ -542,13 +577,13 @@ func (vp *Operator) createCSR() (csr []byte, key *rsa.PrivateKey, err error) {
 	csr, err = vice.CreateCSR(
 		pkix.Name{
 			CommonName:         "vice.sap.com",
-			Country:            []string{"DE"},
-			Province:           []string{"BERLIN"},
-			Locality:           []string{"BERLIN"},
-			Organization:       []string{"SAP SE"},
-			OrganizationalUnit: []string{"Infrastructure Automation"},
+			Country:            []string{vp.ViceConfig.Country},
+			Province:           []string{vp.ViceConfig.Province},
+			Locality:           []string{vp.ViceConfig.Locality},
+			Organization:       []string{vp.ViceConfig.Organization},
+			OrganizationalUnit: []string{vp.ViceConfig.OrganizationalUnit},
 		},
-		"michael02.schmidt@sap.com",
+		vp.ViceConfig.EMail,
 		[]string{"vice.sap.com", "certificates.sap.com"},
 		key,
 	)
@@ -631,7 +666,7 @@ func (vp *Operator) ingressAdd(obj interface{}) {
 
 func (vp *Operator) ingressDelete(obj interface{}) {
 	i := obj.(*v1beta1.Ingress)
-	log.Printf("Deleted ingress %s/%s.",i.GetNamespace(),i.GetName())
+	log.Printf("Deleted ingress %s/%s.", i.GetNamespace(), i.GetName())
 	vp.queue.Add(i)
 }
 
@@ -639,21 +674,21 @@ func (vp *Operator) ingressUpdate(cur, old interface{}) {
 	iOld := old.(*v1beta1.Ingress)
 	iCur := cur.(*v1beta1.Ingress)
 
-	if reflect.DeepEqual(iOld.Spec,iCur.Spec) {
-		log.Printf("Updated ingress %s/%s",iOld.GetNamespace(),iOld.GetName())
+	if reflect.DeepEqual(iOld.Spec, iCur.Spec) {
+		log.Printf("Updated ingress %s/%s", iOld.GetNamespace(), iOld.GetName())
 		vp.queue.Add(iCur)
 	}
 }
 
 func (vp *Operator) secretAdd(obj interface{}) {
 	s := obj.(*v1.Secret)
-	log.Printf("Added secret %s/%s",s.GetNamespace(),s.GetName())
+	log.Printf("Added secret %s/%s", s.GetNamespace(), s.GetName())
 	vp.queue.Add(s)
 }
 
 func (vp *Operator) secretDelete(obj interface{}) {
 	s := obj.(*v1.Secret)
-	log.Printf("Deleted secret %s/%s",s.GetNamespace(),s.GetName())
+	log.Printf("Deleted secret %s/%s", s.GetNamespace(), s.GetName())
 	vp.queue.Add(s)
 
 }
@@ -662,8 +697,8 @@ func (vp *Operator) secretUpdate(cur, old interface{}) {
 	sOld := old.(*v1.Secret)
 	sCur := cur.(*v1.Secret)
 
-	if reflect.DeepEqual(sOld.Data,sCur.Data) {
-		log.Printf("Updated secret %s/%s",sOld.GetNamespace(),sOld.GetName())
+	if reflect.DeepEqual(sOld.Data, sCur.Data) {
+		log.Printf("Updated secret %s/%s", sOld.GetNamespace(), sOld.GetName())
 		vp.queue.Add(sCur)
 	}
 }
@@ -671,7 +706,7 @@ func (vp *Operator) secretUpdate(cur, old interface{}) {
 func (vp *Operator) checkCertificates() {
 	for _, o := range vp.ingressInformer.GetStore().List() {
 		i := o.(*v1beta1.Ingress)
-		log.Printf("Added ingress %s/%s",i.GetNamespace(),i.GetName())
+		log.Printf("Added ingress %s/%s", i.GetNamespace(), i.GetName())
 		vp.queue.Add(i)
 	}
 }
